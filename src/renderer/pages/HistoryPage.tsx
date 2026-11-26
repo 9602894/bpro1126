@@ -22,6 +22,8 @@ import type { ProfileSitesView } from '../../shared/types';
 const MAX_UPDATE_CHECK = 12;
 /** 更新检测并发（jar 源详情较慢，压低并发避免打爆主进程/源站） */
 const UPDATE_CONCURRENCY = 3;
+/** ★ 2026-11-26：跨窗口传递「详情页要定位到哪一集」的 sessionStorage key */
+const DETAIL_FOCUS_KEY = 'winbox:detail-focus';
 
 /** 记录名可能是「剧名 - 集/备注」→ 补图按剧名查（同首页/详情页口径） */
 function baseNameOf(name: string): string {
@@ -202,14 +204,37 @@ export default function HistoryPage() {
   };
 
   const openDetail = (it: WatchHistory) => {
-    if (it.sourceKey && it.vodId) {
-      const latest = loadLatestWatch(it.url) || it;
-      void restoreHistorySource(client, latest).then((source) => {
-        window.dispatchEvent(new CustomEvent('winbox:sources-changed'));
-        return openDetailRoute((to) => nav(to), source.key, latest.vodId!);
-      }).catch((e) => setNotice(`打开详情失败：${e instanceof Error ? e.message : String(e)}`));
+    // ★ 2026-11-26：不再 fallback 到 play！此前 else 分支会把"点详情"静默变成播放。
+    //   详情按钮只在 sourceKey/vodId 齐全时渲染，走到这里说明数据异常，明确提示即可。
+    if (!it.sourceKey || !it.vodId) {
+      setNotice('这条记录缺少详情定位信息，无法打开详情页');
+      return;
     }
-    else play(it);
+    const latest = loadLatestWatch(it.url) || it;
+    /**
+     * ★ 2026-11-26（用户要求）：打开详情窗口时应展示**播放状态**（已定位到历史对应那一集/进度），
+     *   而不是从头展示。这里把定位信息写入 sessionStorage，详情页（独立窗口/同一会话）读取后：
+     *     · 选中对应季/集，滚动到可视区域并高亮；
+     *     · 播放器区域停留在该集待续播状态（startTime = time）；
+     *     · 若详情页不需要该信息，可忽略（向后兼容）。
+     */
+    try {
+      sessionStorage.setItem(DETAIL_FOCUS_KEY, JSON.stringify({
+        key: latest.sourceKey,
+        vodId: latest.vodId,
+        name: latest.name,
+        remarks: latest.remarks,
+        url: latest.url,
+        rawUrl: latest.rawUrl,
+        time: latest.time,
+        flag: latest.flag,
+        at: Date.now(),
+      }));
+    } catch { /* 忽略配额/隐私模式异常 */ }
+    void restoreHistorySource(client, latest).then((source) => {
+      window.dispatchEvent(new CustomEvent('winbox:sources-changed'));
+      return openDetailRoute((to) => nav(to), source.key, latest.vodId!);
+    }).catch((e) => setNotice(`打开详情失败：${e instanceof Error ? e.message : String(e)}`));
   };
 
   /**
@@ -233,19 +258,6 @@ export default function HistoryPage() {
     clearUiMemory();
     setLastDeleted(null);
     refresh();
-  };
-
-  /**
-   * ★ 2026-11-26 修复：卡片整块绑了「播放」，而「详情/移除」按钮位于 hover 才浮出的操作条里。
-   *   鼠标移向按钮途中若 hover 态丢失（滑出边界 / 触屏无 hover / pointer-events 回退），
-   *   click 的 target 就会变成卡片本身，按钮的 stopPropagation 根本执行不到 → 表现为「点详情却开始播放」。
-   *   这里在卡片点击入口统一判断：只要事件源落在操作条或任意按钮内，就不触发播放。
-   *   （按钮侧同时加了 onPointerDown 拦截，作为双保险。）
-   */
-  const onCardClick = (e: React.MouseEvent, it: WatchHistory) => {
-    const t = e.target as HTMLElement | null;
-    if (t && t.closest('button, .hist-ops, .hist-del')) return;
-    play(it);
   };
 
   const resumeCount = items.filter((x) => x.time > 0).length;
@@ -303,9 +315,14 @@ export default function HistoryPage() {
                 // 封面：与其他页面同规则（搜索补图为准 → 源图占位/兜底）
                 const cover = picOf(it);
                 return (
-                <div className="card-media hist-media" key={it.url} onClick={(e) => onCardClick(e, it)}>
+                // ★★ 2026-11-26 关键修复：外层容器**不再绑定 onClick={() => play(it)}**。
+                //   播放点击只绑在「封面区」和「标题区」两个明确的子区域上。
+                //   hover 操作条 .hist-ops 是 .card 的兄弟节点，点击它天然不会冒泡到播放区域，
+                //   即使 CSS 的 pointer-events 回退导致点击穿透，也不会命中播放处理器。
+                <div className="card-media hist-media" key={it.url}>
                   <div className="card">
-                    <div style={{ position: 'relative' }}>
+                    {/* ▼ 封面区：点击 = 续播（唯一可点的播放区域之一） */}
+                    <div style={{ position: 'relative', cursor: 'pointer' }} onClick={() => play(it)}>
                       {cover ? (
                         <img
                           src={cover}
@@ -367,7 +384,8 @@ export default function HistoryPage() {
                         </span>
                       )}
                     </div>
-                    <div className="meta">
+                    {/* ▼ 标题区：点击 = 续播（另一个可点播放区域） */}
+                    <div className="meta" style={{ cursor: 'pointer' }} onClick={() => play(it)}>
                       <div className="name" title={it.name}>{it.name}</div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 2 }}>
                         {it.remarks && <span className="muted" style={{ fontSize: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{it.remarks}</span>}
@@ -376,12 +394,12 @@ export default function HistoryPage() {
                         )}
                       </div>
                     </div>
-                    {/* hover 操作：续播为主，详情/移除为辅
-                        ★ 2026-11-26：按钮加 onPointerDown 拦截，避免 hover 态丢失时事件穿透到卡片触发播放 */}
+                    {/* ▼ 操作条：与播放区域是兄弟节点，点击不会触发 play。
+                        ★ 2026-11-26：按钮加 onPointerDown 拦截 + 自身 onClick stopPropagation 双保险。 */}
                     <div className="hist-ops">
                       {it.sourceKey && it.vodId && (
                         <button
-                          title="打开详情"
+                          title="打开详情（定位到当前播放集）"
                           onPointerDown={(e) => e.stopPropagation()}
                           onClick={(e) => { e.stopPropagation(); openDetail(it); }}
                         >
