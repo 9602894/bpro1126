@@ -8,6 +8,11 @@
 //
 // ★ 2026-11-19：接入移植自修狗TV 的直播链接解析（livePlaybackProbe.ts）：
 //   容器扩展名 → 点播；.m3u8/.m3u → 只读清单探测判定点播/直播；失败静默回退直播。
+//
+// ★ 2026-11-26（用户要求）：
+//   · 重连不再重挂 <video> 元素 → 全屏状态保持；
+//   · 去掉重连次数上限；
+//   · 直播断线静默重连（无提示、无黑屏重建），让用户看不出断线。
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Hls from 'hls.js';
 import { client } from '../api/client';
@@ -113,45 +118,102 @@ async function detectPlaybackSource(
   return { kind, mode: 'live', reason: 'default-live' };
 }
 
+/**
+ * ★ 2026-11-26（用户要求）：
+ *   · 重连逻辑全部在组件内部完成，<video> 元素不会被 React 重建 → 全屏保持；
+ *   · 无限重连 + 1.5s 节流，直播断线静默恢复；
+ *   · HLS 优先复用实例重新加载清单，尽量保留最后一帧，不黑屏；
+ *   · mpegts 只重建 player，不销毁 <video>；
+ *   · 点播错误仍提示，直播错误静默处理（用户看不出断线）。
+ */
 function LiveVideoPlayer({
   url,
-  onReconnect,
   onVideoError,
   onModeDetected,
 }: {
   url: string;
-  onReconnect: () => void;
   onVideoError: (msg: string) => void;
   onModeDetected?: (mode: PlaybackMode, reason: string) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<any>(null);
   const mpegtsRef = useRef<any>(null);
-  const cbRef = useRef({ onReconnect, onVideoError, onModeDetected });
-  cbRef.current = { onReconnect, onVideoError, onModeDetected };
+  const cbRef = useRef({ onVideoError, onModeDetected });
+  cbRef.current = { onVideoError, onModeDetected };
   // ★ 当前解析出的播放模式：点播播完不重连，直播断流才重连
   const modeRef = useRef<PlaybackMode>('live');
+  // ★ 当前媒体类型：重连时决定用哪种恢复策略
+  const kindRef = useRef<MediaKind>('unknown');
 
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !url) return;
 
     let destroyed = false;
-    const destroyHls = () => { if (hlsRef.current) { try { hlsRef.current.destroy(); } catch {} hlsRef.current = null; } };
-    const destroyMpegts = () => { if (mpegtsRef.current) { try { mpegtsRef.current.destroy(); } catch {} mpegtsRef.current = null; } };
+    let retryTimer: number | null = null;
+    let lastRetryAt = 0;
+
+    const destroyHls = () => {
+      if (hlsRef.current) {
+        try { hlsRef.current.destroy(); } catch { /* ignore */ }
+        hlsRef.current = null;
+      }
+    };
+    const destroyMpegts = () => {
+      if (mpegtsRef.current) {
+        try { mpegtsRef.current.destroy(); } catch { /* ignore */ }
+        mpegtsRef.current = null;
+      }
+    };
 
     const safePlay = () => {
       const p = v.play();
       if (p && typeof p.catch === 'function') p.catch(() => undefined);
     };
 
-    const playNative = () => {
-      v.src = url;
-      v.load();
+    function playNative() {
+      // 保留 <video> 元素，只换 src，全屏不受影响
+      if (v.src !== url) {
+        v.src = url;
+        try { v.load(); } catch { /* ignore */ }
+      }
       safePlay();
-    };
+    }
 
-    const playHls = (sourceUrl: string) => {
+    /**
+     * 静默重连调度器：无限重试，1.5s 节流。
+     * 全屏保持的关键 —— 不销毁 <video> 元素，只重置播放引擎。
+     */
+    function scheduleRetry() {
+      if (destroyed || modeRef.current !== 'live') return;
+      if (retryTimer != null) return; // 已有排队
+      const now = Date.now();
+      const wait = Math.max(0, 1500 - (now - lastRetryAt));
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        if (destroyed || modeRef.current !== 'live') return;
+        lastRetryAt = Date.now();
+
+        const kind = kindRef.current;
+        if (kind === 'hls' && hlsRef.current) {
+          // ★ 复用同一个 Hls 实例重新加载清单，<video> 不动，全屏保持，画面尽量不黑
+          try {
+            hlsRef.current.stopLoad();
+            hlsRef.current.loadSource(url);
+            hlsRef.current.startLoad();
+            return;
+          } catch { /* fallthrough */ }
+        }
+        if (kind === 'flv') { void playMpegts('flv', url, 'live'); return; }
+        if (kind === 'ts') { void playMpegts('mpegts', url, 'live'); return; }
+        if (kind === 'native') { playNative(); return; }
+        // hls 兜底 / unknown
+        playHls(url);
+      }, wait);
+    }
+
+    function playHls(sourceUrl: string) {
+      destroyHls();
       if (!Hls.isSupported()) { playNative(); return; }
       const hls = new Hls({
         enableWorker: true,
@@ -178,25 +240,25 @@ function LiveVideoPlayer({
         if (destroyed) return;
         if (!data?.fatal) return;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          cbRef.current.onVideoError('HLS 网络错误，尝试恢复…');
-          try { hls.startLoad(); } catch {}
+          // 先尝试 hls.js 内置恢复；同时排一个兜底重连（若恢复则 onPlaying 会取消）
+          try { hls.startLoad(); } catch { /* ignore */ }
+          scheduleRetry();
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          cbRef.current.onVideoError('HLS 解码错误，尝试恢复…');
-          try { hls.recoverMediaError(); } catch {}
+          try { hls.recoverMediaError(); } catch { /* ignore */ }
         } else {
-          cbRef.current.onVideoError(`HLS 失败：${data.details || data.type}`);
-          destroyHls();
-          // ★ 点播 HLS 播放失败不自动重连；直播才重连
-          if (modeRef.current === 'live') cbRef.current.onReconnect();
+          scheduleRetry();
         }
+        // ★ 直播错误静默，不调用 onVideoError 弹提示
       });
-    };
+    }
 
-    const playMpegts = async (type: 'flv' | 'mpegts', sourceUrl: string, mode: PlaybackMode) => {
+    async function playMpegts(type: 'flv' | 'mpegts', sourceUrl: string, mode: PlaybackMode) {
+      destroyMpegts();
       try {
         // @ts-ignore 动态加载可选依赖
         const mod = await import(/* @vite-ignore */ 'mpegts.js').catch(() => null);
         const mpegts: any = (mod as any)?.default || (mod as any);
+        if (destroyed) return;
         if (!mpegts || typeof mpegts.isSupported !== 'function' || !mpegts.isSupported()) {
           playNative();
           return;
@@ -208,19 +270,21 @@ function LiveVideoPlayer({
         mpegtsRef.current = player;
         player.attachMediaElement(v);
         player.load();
-        try { player.play(); } catch {}
-        player.on(mpegts.Events?.ERROR || 'error', (errType: unknown, errDetail: unknown) => {
-          cbRef.current.onVideoError(`流错误：${errType}/${errDetail}`);
-          if (modeRef.current === 'live') cbRef.current.onReconnect();
+        try { player.play(); } catch { /* ignore */ }
+        player.on(mpegts.Events?.ERROR || 'error', () => {
+          if (destroyed) return;
+          if (modeRef.current === 'live') scheduleRetry();
+          // 直播错误静默
         });
       } catch {
         playNative();
       }
-    };
+    }
 
     (async () => {
       const { kind, mode, reason } = await detectPlaybackSource(url);
       if (destroyed) return;
+      kindRef.current = kind;
       modeRef.current = mode;
       cbRef.current.onModeDetected?.(mode, reason);
       if (kind === 'hls') playHls(url);
@@ -232,17 +296,23 @@ function LiveVideoPlayer({
 
     const onEnded = () => {
       // ★ 点播播完就是播完；直播流意外 ended 才重连
-      if (modeRef.current === 'live') cbRef.current.onReconnect();
+      if (modeRef.current === 'live') scheduleRetry();
     };
     const onErr = () => {
-      const err = v.error;
-      const code = err?.code;
-      const msg = code === 1 ? '用户中止' : code === 2 ? '网络错误' : code === 3 ? '解码错误' : code === 4 ? '源不支持' : `错误(${code ?? '?'})`;
-      cbRef.current.onVideoError(msg);
-      // ★ 点播的网络/格式错误不自动重连，交给用户手动刷新
-      if ((code === 2 || code === 4) && modeRef.current === 'live') cbRef.current.onReconnect();
+      const code = v.error?.code;
+      if (modeRef.current === 'live') {
+        // ★ 直播错误静默重连，不弹提示
+        scheduleRetry();
+      } else {
+        const msg = code === 1 ? '用户中止' : code === 2 ? '网络错误' : code === 3 ? '解码错误' : code === 4 ? '源不支持' : `错误(${code ?? '?'})`;
+        cbRef.current.onVideoError(msg);
+      }
     };
-    const onPlaying = () => cbRef.current.onVideoError('');
+    const onPlaying = () => {
+      // ★ 播放已恢复 → 取消挂起的重连，避免多此一举地重新 loadSource
+      if (retryTimer != null) { window.clearTimeout(retryTimer); retryTimer = null; }
+      cbRef.current.onVideoError('');
+    };
     v.addEventListener('ended', onEnded);
     v.addEventListener('error', onErr);
     v.addEventListener('playing', onPlaying);
@@ -250,13 +320,15 @@ function LiveVideoPlayer({
 
     return () => {
       destroyed = true;
+      if (retryTimer != null) { window.clearTimeout(retryTimer); retryTimer = null; }
       v.removeEventListener('ended', onEnded);
       v.removeEventListener('error', onErr);
       v.removeEventListener('playing', onPlaying);
       v.removeEventListener('play', onPlaying);
       destroyHls();
       destroyMpegts();
-      try { v.removeAttribute('src'); v.load(); } catch {}
+      // ★ 不 removeAttribute('src')：让 <video> 元素保持挂载，
+      //   切台时新一次 effect 会接管；断线重连时元素根本不会被重建 → 全屏保持
     };
   }, [url]);
 
@@ -289,11 +361,8 @@ export default function LivePage() {
   const [subCount, setSubCount] = useState(0);
   const [subEnabled, setSubEnabled] = useState(0);
 
-  const [reconnectKey, setReconnectKey] = useState(0);
+  // ★ 仅用于点播错误 / 切台提示，直播断线不再写入
   const [reconnectMsg, setReconnectMsg] = useState('');
-  const reconnectCountRef = useRef(0);
-  const lastReconnectAtRef = useRef(0);
-  const MAX_RECONNECT = 50;
 
   // ★ 播放方式识别结果（来自 livePlaybackProbe）
   const [playMode, setPlayMode] = useState<PlaybackMode>('live');
@@ -309,27 +378,8 @@ export default function LivePage() {
   useEffect(() => {
     if (!playUrl) { setPlaybackUrl(''); return; }
     setPlaybackUrl(playUrl);
-    reconnectCountRef.current = 0;
-    lastReconnectAtRef.current = 0;
     setReconnectMsg('');
   }, [playUrl]);
-
-  const doReconnect = useCallback(() => {
-    const now = Date.now();
-    if (now - lastReconnectAtRef.current < 3000) return;
-    lastReconnectAtRef.current = now;
-    reconnectCountRef.current += 1;
-    const n = reconnectCountRef.current;
-    if (n > MAX_RECONNECT) {
-      setReconnectMsg(`已连续重连 ${MAX_RECONNECT} 次仍失败，请切换线路`);
-      return;
-    }
-    setReconnectMsg(`断线重连中…（第 ${n} 次）`);
-    setReconnectKey((k) => k + 1);
-    window.setTimeout(() => {
-      setReconnectMsg((cur) => (cur.startsWith('断线重连中') ? '' : cur));
-    }, 3000);
-  }, []);
 
   const handleVideoError = useCallback((msg: string) => {
     if (msg) setReconnectMsg(msg);
@@ -721,10 +771,11 @@ export default function LivePage() {
               {playUrl ? (
                 <div className="live-player" style={{ position: 'relative' }}>
                   {playbackUrl ? (
+                    // ★ 2026-11-26：不再使用 key={`${playbackUrl}__${reconnectKey}`}。
+                    //   url 变化由组件内 useEffect([url]) 处理；断线重连完全走内部逻辑，
+                    //   <video> 元素始终复用 → 全屏状态不会因重连而丢失。
                     <LiveVideoPlayer
-                      key={`${playbackUrl}__${reconnectKey}`}
                       url={playbackUrl}
-                      onReconnect={doReconnect}
                       onVideoError={handleVideoError}
                       onModeDetected={(mode, reason) => {
                         setPlayMode(mode);
@@ -735,6 +786,7 @@ export default function LivePage() {
                     <div className="empty" style={{ width: '100%', height: '100%' }}>加载中…</div>
                   )}
                   {reconnectMsg && (
+                    // ★ 仅点播错误 / 切台提示会走到这里；直播断线静默，不打扰用户
                     <div
                       style={{
                         position: 'absolute', top: 12, left: 12,
