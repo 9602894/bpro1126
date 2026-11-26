@@ -235,6 +235,19 @@ export default function HistoryPage() {
     refresh();
   };
 
+  /**
+   * ★ 2026-11-26 修复：卡片整块绑了「播放」，而「详情/移除」按钮位于 hover 才浮出的操作条里。
+   *   鼠标移向按钮途中若 hover 态丢失（滑出边界 / 触屏无 hover / pointer-events 回退），
+   *   click 的 target 就会变成卡片本身，按钮的 stopPropagation 根本执行不到 → 表现为「点详情却开始播放」。
+   *   这里在卡片点击入口统一判断：只要事件源落在操作条或任意按钮内，就不触发播放。
+   *   （按钮侧同时加了 onPointerDown 拦截，作为双保险。）
+   */
+  const onCardClick = (e: React.MouseEvent, it: WatchHistory) => {
+    const t = e.target as HTMLElement | null;
+    if (t && t.closest('button, .hist-ops, .hist-del')) return;
+    play(it);
+  };
+
   const resumeCount = items.filter((x) => x.time > 0).length;
 
   return (
@@ -290,7 +303,7 @@ export default function HistoryPage() {
                 // 封面：与其他页面同规则（搜索补图为准 → 源图占位/兜底）
                 const cover = picOf(it);
                 return (
-                <div className="card-media hist-media" key={it.url} onClick={() => play(it)}>
+                <div className="card-media hist-media" key={it.url} onClick={(e) => onCardClick(e, it)}>
                   <div className="card">
                     <div style={{ position: 'relative' }}>
                       {cover ? (
@@ -321,6 +334,7 @@ export default function HistoryPage() {
                           className="hist-del"
                           title="移除这条记录"
                           aria-label={`移除 ${it.name}`}
+                          onPointerDown={(e) => e.stopPropagation()}
                           onClick={(e) => { e.stopPropagation(); del(it); }}
                         >
                           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4">
@@ -362,15 +376,24 @@ export default function HistoryPage() {
                         )}
                       </div>
                     </div>
-                    {/* hover 操作：续播为主，详情/移除为辅 */}
+                    {/* hover 操作：续播为主，详情/移除为辅
+                        ★ 2026-11-26：按钮加 onPointerDown 拦截，避免 hover 态丢失时事件穿透到卡片触发播放 */}
                     <div className="hist-ops">
                       {it.sourceKey && it.vodId && (
-                        <button title="打开详情" onClick={(e) => { e.stopPropagation(); openDetail(it); }}>
+                        <button
+                          title="打开详情"
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => { e.stopPropagation(); openDetail(it); }}
+                        >
                           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="7" /><path d="M21 21l-4.3-4.3" /></svg>
                           详情
                         </button>
                       )}
-                      <button title="从历史移除" onClick={(e) => { e.stopPropagation(); del(it); }}>
+                      <button
+                        title="从历史移除"
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onClick={(e) => { e.stopPropagation(); del(it); }}
+                      >
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14" /></svg>
                         移除
                       </button>
